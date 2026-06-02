@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Quest WebXR Sender</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: white;
+      padding: 24px;
+      font-size: 18px;
+    }
+
+    input, button {
+      font-size: 18px;
+      padding: 10px;
+      margin: 6px 0;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    #log {
+      white-space: pre-wrap;
+      background: #222;
+      padding: 12px;
+      margin-top: 16px;
+      height: 240px;
+      overflow: auto;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Quest WebXR → OpenArm MuJoCo</h2>
+
+  <label>WebSocket URL</label>
+  <input id="wsUrl" value="ws://192.168.43.185:8765" />
+
+  <button onclick="connectWs()">1. Connect WebSocket</button>
+  <button onclick="sendTest()">2. Send Test Packet</button>
+  <button onclick="enterVr()">3. Enter VR / Start Controller Tracking</button>
+  <button onclick="resetOrigin()">Reset Controller Origin</button>
+
+  <div id="log">Waiting...</div>
+
+  <script>
+    let ws = null;
+    let xrSession = null;
+    let xrRefSpace = null;
+    let origin = null;
+    let needResetOrigin = true;
+    let lastSendTime = 0;
+
+    function log(msg) {
+      const el = document.getElementById("log");
+      el.textContent = msg + "\n" + el.textContent;
+    }
+
+    function connectWs() {
+      const url = document.getElementById("wsUrl").value;
+      ws = new WebSocket(url);
+
+      ws.onopen = () => log("WebSocket connected: " + url);
+      ws.onclose = () => log("WebSocket closed");
+      ws.onerror = (e) => log("WebSocket error");
+      ws.onmessage = (e) => log("From server: " + e.data);
+    }
+
+    function sendPacket(packet) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      ws.send(JSON.stringify(packet));
+    }
+
+    function sendTest() {
+      const packet = {
+        x: 0.05,
+        y: 0.00,
+        z: 0.00,
+        grip: 0.0
+      };
+
+      sendPacket(packet);
+      log("Sent test: " + JSON.stringify(packet));
+    }
+
+    function resetOrigin() {
+      needResetOrigin = true;
+      log("Origin will reset on next controller pose");
+    }
+
+    async function enterVr() {
+      if (!navigator.xr) {
+        log("WebXR not available in this browser");
+        return;
+      }
+
+      const supported = await navigator.xr.isSessionSupported("immersive-vr");
+      if (!supported) {
+        log("immersive-vr not supported");
+        return;
+      }
+
+      xrSession = await navigator.xr.requestSession("immersive-vr", {
+        optionalFeatures: ["local-floor"]
+      });
+
+      xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
+      xrSession.requestAnimationFrame(onXrFrame);
+
+      log("Entered VR session");
+    }
+
+    function getGripValue(inputSource) {
+      if (!inputSource.gamepad || !inputSource.gamepad.buttons) {
+        return 0.0;
+      }
+
+      const buttons = inputSource.gamepad.buttons;
+
+      let grip = 0.0;
+
+      // Thường Quest controller:
+      // buttons[0] gần trigger
+      // buttons[1] thường là grip
+      if (buttons.length > 1) {
+        grip = buttons[1].value;
+      } else if (buttons.length > 0) {
+        grip = buttons[0].value;
+      }
+
+      return grip;
+    }
+
+    function onXrFrame(time, frame) {
+      xrSession.requestAnimationFrame(onXrFrame);
+
+      const now = performance.now();
+
+      // Gửi khoảng 30Hz, tránh spam quá nhiều
+      if (now - lastSendTime < 33) {
+        return;
+      }
+
+      lastSendTime = now;
+
+      for (const inputSource of xrSession.inputSources) {
+        if (inputSource.handedness !== "left") {
+          continue;
+        }
+
+        const space = inputSource.gripSpace || inputSource.targetRaySpace;
+
+        if (!space) {
+          continue;
+        }
+
+        const pose = frame.getPose(space, xrRefSpace);
+
+        if (!pose) {
+          continue;
+        }
+
+        const p = pose.transform.position;
+
+        if (needResetOrigin || origin === null) {
+          origin = {
+            x: p.x,
+            y: p.y,
+            z: p.z
+          };
+
+          needResetOrigin = false;
+          log("Origin set: " + JSON.stringify(origin));
+        }
+
+        const packet = {
+          x: p.x - origin.x,
+          y: p.y - origin.y,
+          z: p.z - origin.z,
+          grip: getGripValue(inputSource)
+        };
+
+        sendPacket(packet);
+
+        log(
+          "Sent: x=" + packet.x.toFixed(3) +
+          " y=" + packet.y.toFixed(3) +
+          " z=" + packet.z.toFixed(3) +
+          " grip=" + packet.grip.toFixed(2)
+        );
+      }
+    }
+  </script>
+</body>
+</html>
