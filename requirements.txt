@@ -1,0 +1,5 @@
+mujoco>=3.6.0
+numpy
+imageio
+websockets
+ruff==0.14.11
