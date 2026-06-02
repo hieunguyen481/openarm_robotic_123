@@ -39,7 +39,7 @@
   <h2>Quest WebXR → OpenArm MuJoCo</h2>
 
   <label>WebSocket URL</label>
-  <input id="wsUrl" value="ws://192.168.43.185:8765" />
+  <input id="wsUrl" />
 
   <button onclick="connectWs()">1. Connect WebSocket</button>
   <button onclick="sendTest()">2. Send Test Packet</button>
@@ -52,9 +52,21 @@
     let ws = null;
     let xrSession = null;
     let xrRefSpace = null;
+    let xrGl = null;
+    let xrProgram = null;
+    let xrTexture = null;
+    let xrPositionBuffer = null;
+    let xrTexCoordBuffer = null;
+    let latestFrameBitmap = null;
+    let frameTextureDirty = false;
     let origin = null;
     let needResetOrigin = true;
     let lastSendTime = 0;
+    let lastPoseLogTime = 0;
+
+    const wsScheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    document.getElementById("wsUrl").value =
+      wsScheme + "//" + window.location.hostname + ":8765";
 
     function log(msg) {
       const el = document.getElementById("log");
@@ -68,7 +80,30 @@
       ws.onopen = () => log("WebSocket connected: " + url);
       ws.onclose = () => log("WebSocket closed");
       ws.onerror = (e) => log("WebSocket error");
-      ws.onmessage = (e) => log("From server: " + e.data);
+      ws.onmessage = (e) => handleServerMessage(e.data);
+    }
+
+    async function handleServerMessage(data) {
+      let msg = null;
+      try {
+        msg = JSON.parse(data);
+      } catch (e) {
+        log("From server: " + data);
+        return;
+      }
+
+      if (msg.type === "frame" && msg.encoding === "jpg_base64") {
+        const response = await fetch("data:image/jpeg;base64," + msg.data);
+        const blob = await response.blob();
+        if (latestFrameBitmap) {
+          latestFrameBitmap.close();
+        }
+        latestFrameBitmap = await createImageBitmap(blob);
+        frameTextureDirty = true;
+        return;
+      }
+
+      log("From server: " + data);
     }
 
     function sendPacket(packet) {
@@ -108,8 +143,31 @@
         return;
       }
 
-      xrSession = await navigator.xr.requestSession("immersive-vr", {
-        optionalFeatures: ["local-floor"]
+      try {
+        xrSession = await navigator.xr.requestSession("immersive-vr", {
+          optionalFeatures: ["local-floor", "bounded-floor"]
+        });
+      } catch (e) {
+        log("Failed to enter VR: " + e.message);
+        return;
+      }
+
+      const canvas = document.createElement("canvas");
+      xrGl = canvas.getContext("webgl", {
+        alpha: false,
+        antialias: true,
+        xrCompatible: true
+      });
+
+      if (!xrGl) {
+        log("WebGL not available");
+        return;
+      }
+
+      await xrGl.makeXRCompatible();
+      initGlScene();
+      xrSession.updateRenderState({
+        baseLayer: new XRWebGLLayer(xrSession, xrGl)
       });
 
       xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
@@ -142,6 +200,14 @@
     function onXrFrame(time, frame) {
       xrSession.requestAnimationFrame(onXrFrame);
 
+      const layer = xrSession.renderState.baseLayer;
+      if (xrGl && layer) {
+        xrGl.bindFramebuffer(xrGl.FRAMEBUFFER, layer.framebuffer);
+        xrGl.clearColor(0.02, 0.04, 0.08, 1.0);
+        xrGl.clear(xrGl.COLOR_BUFFER_BIT | xrGl.DEPTH_BUFFER_BIT);
+        drawLatestFrame(frame);
+      }
+
       const now = performance.now();
 
       // Gửi khoảng 30Hz, tránh spam quá nhiều
@@ -151,24 +217,36 @@
 
       lastSendTime = now;
 
+      let selectedSource = null;
+      let selectedPose = null;
+      let selectedPosition = null;
+
       for (const inputSource of xrSession.inputSources) {
-        if (inputSource.handedness !== "left") {
-          continue;
-        }
-
         const space = inputSource.gripSpace || inputSource.targetRaySpace;
-
         if (!space) {
           continue;
         }
 
         const pose = frame.getPose(space, xrRefSpace);
-
         if (!pose) {
           continue;
         }
 
-        const p = pose.transform.position;
+        if (inputSource.handedness === "left") {
+          selectedSource = inputSource;
+          selectedPose = pose;
+          break;
+        }
+
+        if (selectedSource === null) {
+          selectedSource = inputSource;
+          selectedPose = pose;
+        }
+      }
+
+      if (selectedSource && selectedPose) {
+        const p = selectedPose.transform.position;
+        selectedPosition = p;
 
         if (needResetOrigin || origin === null) {
           origin = {
@@ -185,17 +263,151 @@
           x: p.x - origin.x,
           y: p.y - origin.y,
           z: p.z - origin.z,
-          grip: getGripValue(inputSource)
+          grip: getGripValue(selectedSource)
         };
 
         sendPacket(packet);
 
-        log(
-          "Sent: x=" + packet.x.toFixed(3) +
-          " y=" + packet.y.toFixed(3) +
-          " z=" + packet.z.toFixed(3) +
-          " grip=" + packet.grip.toFixed(2)
+        if (now - lastPoseLogTime > 500) {
+          lastPoseLogTime = now;
+          log(
+            "Sent " + (selectedSource.handedness || "unknown") +
+            ": x=" + packet.x.toFixed(3) +
+            " y=" + packet.y.toFixed(3) +
+            " z=" + packet.z.toFixed(3) +
+            " grip=" + packet.grip.toFixed(2)
+          );
+        }
+      } else if (now - lastPoseLogTime > 1000) {
+        lastPoseLogTime = now;
+        log("No tracked controller pose. Press a Quest controller trigger/button.");
+      }
+    }
+
+    function compileShader(type, source) {
+      const shader = xrGl.createShader(type);
+      xrGl.shaderSource(shader, source);
+      xrGl.compileShader(shader);
+      if (!xrGl.getShaderParameter(shader, xrGl.COMPILE_STATUS)) {
+        throw new Error(xrGl.getShaderInfoLog(shader));
+      }
+      return shader;
+    }
+
+    function initGlScene() {
+      const vertexShader = compileShader(xrGl.VERTEX_SHADER, `
+        attribute vec2 a_position;
+        attribute vec2 a_texCoord;
+        varying vec2 v_texCoord;
+        void main() {
+          gl_Position = vec4(a_position, 0.0, 1.0);
+          v_texCoord = a_texCoord;
+        }
+      `);
+      const fragmentShader = compileShader(xrGl.FRAGMENT_SHADER, `
+        precision mediump float;
+        varying vec2 v_texCoord;
+        uniform sampler2D u_image;
+        void main() {
+          gl_FragColor = texture2D(u_image, v_texCoord);
+        }
+      `);
+
+      xrProgram = xrGl.createProgram();
+      xrGl.attachShader(xrProgram, vertexShader);
+      xrGl.attachShader(xrProgram, fragmentShader);
+      xrGl.linkProgram(xrProgram);
+
+      xrPositionBuffer = xrGl.createBuffer();
+      xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrPositionBuffer);
+      xrGl.bufferData(
+        xrGl.ARRAY_BUFFER,
+        new Float32Array([
+          -1, -1,
+           1, -1,
+          -1,  1,
+          -1,  1,
+           1, -1,
+           1,  1
+        ]),
+        xrGl.STATIC_DRAW
+      );
+
+      xrTexCoordBuffer = xrGl.createBuffer();
+      xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrTexCoordBuffer);
+      xrGl.bufferData(
+        xrGl.ARRAY_BUFFER,
+        new Float32Array([
+          0, 1,
+          1, 1,
+          0, 0,
+          0, 0,
+          1, 1,
+          1, 0
+        ]),
+        xrGl.STATIC_DRAW
+      );
+
+      xrTexture = xrGl.createTexture();
+      xrGl.bindTexture(xrGl.TEXTURE_2D, xrTexture);
+      xrGl.texParameteri(xrGl.TEXTURE_2D, xrGl.TEXTURE_MIN_FILTER, xrGl.LINEAR);
+      xrGl.texParameteri(xrGl.TEXTURE_2D, xrGl.TEXTURE_MAG_FILTER, xrGl.LINEAR);
+      xrGl.texParameteri(xrGl.TEXTURE_2D, xrGl.TEXTURE_WRAP_S, xrGl.CLAMP_TO_EDGE);
+      xrGl.texParameteri(xrGl.TEXTURE_2D, xrGl.TEXTURE_WRAP_T, xrGl.CLAMP_TO_EDGE);
+      xrGl.texImage2D(
+        xrGl.TEXTURE_2D,
+        0,
+        xrGl.RGBA,
+        1,
+        1,
+        0,
+        xrGl.RGBA,
+        xrGl.UNSIGNED_BYTE,
+        new Uint8Array([5, 10, 20, 255])
+      );
+    }
+
+    function drawLatestFrame(frame) {
+      if (!xrProgram || !xrTexture) {
+        return;
+      }
+
+      const layer = xrSession.renderState.baseLayer;
+      if (latestFrameBitmap && frameTextureDirty) {
+        xrGl.bindTexture(xrGl.TEXTURE_2D, xrTexture);
+        xrGl.texImage2D(
+          xrGl.TEXTURE_2D,
+          0,
+          xrGl.RGBA,
+          xrGl.RGBA,
+          xrGl.UNSIGNED_BYTE,
+          latestFrameBitmap
         );
+        frameTextureDirty = false;
+      }
+
+      const pose = frame.getViewerPose(xrRefSpace);
+      if (!pose) {
+        return;
+      }
+
+      xrGl.useProgram(xrProgram);
+      xrGl.bindTexture(xrGl.TEXTURE_2D, xrTexture);
+
+      const positionLocation = xrGl.getAttribLocation(xrProgram, "a_position");
+      xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrPositionBuffer);
+      xrGl.enableVertexAttribArray(positionLocation);
+      xrGl.vertexAttribPointer(positionLocation, 2, xrGl.FLOAT, false, 0, 0);
+
+      const texCoordLocation = xrGl.getAttribLocation(xrProgram, "a_texCoord");
+      xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrTexCoordBuffer);
+      xrGl.enableVertexAttribArray(texCoordLocation);
+      xrGl.vertexAttribPointer(texCoordLocation, 2, xrGl.FLOAT, false, 0, 0);
+
+      for (const view of pose.views) {
+        const viewport = layer.getViewport(view);
+        xrGl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        xrGl.drawArrays(xrGl.TRIANGLES, 0, 6);
       }
     }
   </script>

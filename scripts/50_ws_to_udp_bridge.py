@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import socket
+import ssl
 
 import websockets
 
@@ -12,6 +13,8 @@ parser.add_argument("--ws-ip", default="0.0.0.0")
 parser.add_argument("--ws-port", type=int, default=8765)
 parser.add_argument("--udp-ip", default="127.0.0.1")
 parser.add_argument("--udp-port", type=int, default=5005)
+parser.add_argument("--certfile")
+parser.add_argument("--keyfile")
 args = parser.parse_args()
 
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -26,10 +29,24 @@ async def handler(websocket):
 
 
 async def main():
-    print(f"WebSocket listening on {args.ws_ip}:{args.ws_port}")
+    ssl_context = None
+    scheme = "ws"
+    if args.certfile or args.keyfile:
+        if not args.certfile or not args.keyfile:
+            raise SystemExit("--certfile and --keyfile must be used together")
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(args.certfile, args.keyfile)
+        scheme = "wss"
+
+    print(f"WebSocket listening on {scheme}://{args.ws_ip}:{args.ws_port}")
     print(f"Forwarding to UDP {args.udp_ip}:{args.udp_port}")
 
-    async with websockets.serve(handler, args.ws_ip, args.ws_port):
+    async with websockets.serve(
+        handler,
+        args.ws_ip,
+        args.ws_port,
+        ssl=ssl_context,
+    ):
         await asyncio.Future()
 
 
