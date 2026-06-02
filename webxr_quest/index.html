@@ -64,6 +64,11 @@
     let lastSendTime = 0;
     let lastPoseLogTime = 0;
 
+    const screenDistance = 3.0;
+    const screenWidth = 2.2;
+    const screenHeight = 1.35;
+    const screenBrightness = 0.78;
+
     const wsScheme = window.location.protocol === "https:" ? "wss:" : "ws:";
     document.getElementById("wsUrl").value =
       wsScheme + "//" + window.location.hostname + ":8765";
@@ -296,11 +301,12 @@
 
     function initGlScene() {
       const vertexShader = compileShader(xrGl.VERTEX_SHADER, `
-        attribute vec2 a_position;
+        attribute vec3 a_position;
         attribute vec2 a_texCoord;
+        uniform mat4 u_matrix;
         varying vec2 v_texCoord;
         void main() {
-          gl_Position = vec4(a_position, 0.0, 1.0);
+          gl_Position = u_matrix * vec4(a_position, 1.0);
           v_texCoord = a_texCoord;
         }
       `);
@@ -308,8 +314,10 @@
         precision mediump float;
         varying vec2 v_texCoord;
         uniform sampler2D u_image;
+        uniform float u_brightness;
         void main() {
-          gl_FragColor = texture2D(u_image, v_texCoord);
+          vec4 color = texture2D(u_image, v_texCoord);
+          gl_FragColor = vec4(color.rgb * u_brightness, 1.0);
         }
       `);
 
@@ -320,15 +328,17 @@
 
       xrPositionBuffer = xrGl.createBuffer();
       xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrPositionBuffer);
+      const halfWidth = screenWidth * 0.5;
+      const halfHeight = screenHeight * 0.5;
       xrGl.bufferData(
         xrGl.ARRAY_BUFFER,
         new Float32Array([
-          -1, -1,
-           1, -1,
-          -1,  1,
-          -1,  1,
-           1, -1,
-           1,  1
+          -halfWidth, -halfHeight, -screenDistance,
+           halfWidth, -halfHeight, -screenDistance,
+          -halfWidth,  halfHeight, -screenDistance,
+          -halfWidth,  halfHeight, -screenDistance,
+           halfWidth, -halfHeight, -screenDistance,
+           halfWidth,  halfHeight, -screenDistance
         ]),
         xrGl.STATIC_DRAW
       );
@@ -393,20 +403,26 @@
 
       xrGl.useProgram(xrProgram);
       xrGl.bindTexture(xrGl.TEXTURE_2D, xrTexture);
+      xrGl.disable(xrGl.DEPTH_TEST);
 
       const positionLocation = xrGl.getAttribLocation(xrProgram, "a_position");
       xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrPositionBuffer);
       xrGl.enableVertexAttribArray(positionLocation);
-      xrGl.vertexAttribPointer(positionLocation, 2, xrGl.FLOAT, false, 0, 0);
+      xrGl.vertexAttribPointer(positionLocation, 3, xrGl.FLOAT, false, 0, 0);
 
       const texCoordLocation = xrGl.getAttribLocation(xrProgram, "a_texCoord");
       xrGl.bindBuffer(xrGl.ARRAY_BUFFER, xrTexCoordBuffer);
       xrGl.enableVertexAttribArray(texCoordLocation);
       xrGl.vertexAttribPointer(texCoordLocation, 2, xrGl.FLOAT, false, 0, 0);
 
+      const matrixLocation = xrGl.getUniformLocation(xrProgram, "u_matrix");
+      const brightnessLocation = xrGl.getUniformLocation(xrProgram, "u_brightness");
+      xrGl.uniform1f(brightnessLocation, screenBrightness);
+
       for (const view of pose.views) {
         const viewport = layer.getViewport(view);
         xrGl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        xrGl.uniformMatrix4fv(matrixLocation, false, view.projectionMatrix);
         xrGl.drawArrays(xrGl.TRIANGLES, 0, 6);
       }
     }
